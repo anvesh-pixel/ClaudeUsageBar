@@ -288,19 +288,38 @@ namespace ClaudeUsageBar
             using (var k = Registry.CurrentUser.CreateSubKey(Key)) k.SetValue(name, value, RegistryValueKind.DWord);
         }
 
+        // Windows' Startup Apps on/off switch (Task Manager / Settings → Apps → Startup).
+        // First byte: even = enabled, odd = disabled. Some setups skip Run entries that have no
+        // approval value at all, so it's written explicitly when enabling.
+        const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
         public static bool StartWithWindows
         {
             get
             {
                 using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
-                    return k != null && k.GetValue(RunName) != null;
+                    if (k == null || k.GetValue(RunName) == null) return false;
+                using (var a = Registry.CurrentUser.OpenSubKey(ApprovedKey))
+                {
+                    var b = a == null ? null : a.GetValue(RunName) as byte[];
+                    return b == null || b.Length == 0 || (b[0] & 1) == 0;
+                }
             }
             set
             {
                 using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+                using (var a = Registry.CurrentUser.CreateSubKey(ApprovedKey))
                 {
-                    if (value) k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
-                    else k.DeleteValue(RunName, false);
+                    if (value)
+                    {
+                        k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
+                        a.SetValue(RunName, new byte[] { 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, RegistryValueKind.Binary);
+                    }
+                    else
+                    {
+                        k.DeleteValue(RunName, false);
+                        a.DeleteValue(RunName, false);
+                    }
                 }
             }
         }
