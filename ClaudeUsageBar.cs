@@ -288,39 +288,61 @@ namespace ClaudeUsageBar
             using (var k = Registry.CurrentUser.CreateSubKey(Key)) k.SetValue(name, value, RegistryValueKind.DWord);
         }
 
-        // Windows' Startup Apps on/off switch (Task Manager / Settings → Apps → Startup).
-        // First byte: even = enabled, odd = disabled. Some setups skip Run entries that have no
-        // approval value at all, so it's written explicitly when enabling.
+        // Startup uses a per-user Task Scheduler logon task, not the Run key: Explorer can silently
+        // skip Run entries (seen even with a valid StartupApproved value), while logon tasks
+        // always fire. The 10 s delay lets the taskbar come up first.
+        const string TaskName = "ClaudeUsageBar";
         const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
+        static int Schtasks(string args)
+        {
+            var psi = new ProcessStartInfo("schtasks.exe", args)
+            {
+                UseShellExecute = false, CreateNoWindow = true,
+                RedirectStandardOutput = true, RedirectStandardError = true
+            };
+            using (var p = Process.Start(psi))
+            {
+                p.StandardOutput.ReadToEnd(); p.StandardError.ReadToEnd();
+                if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } return -1; }
+                return p.ExitCode;
+            }
+        }
+
+        static void RemoveLegacyRunEntry()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true)) if (k != null) k.DeleteValue(RunName, false);
+                using (var a = Registry.CurrentUser.OpenSubKey(ApprovedKey, true)) if (a != null) a.DeleteValue(RunName, false);
+            }
+            catch { }
+        }
 
         public static bool StartWithWindows
         {
-            get
-            {
-                using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
-                    if (k == null || k.GetValue(RunName) == null) return false;
-                using (var a = Registry.CurrentUser.OpenSubKey(ApprovedKey))
-                {
-                    var b = a == null ? null : a.GetValue(RunName) as byte[];
-                    return b == null || b.Length == 0 || (b[0] & 1) == 0;
-                }
-            }
+            get { return Schtasks("/query /tn \"" + TaskName + "\"") == 0; }
             set
             {
-                using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
-                using (var a = Registry.CurrentUser.CreateSubKey(ApprovedKey))
-                {
-                    if (value)
-                    {
-                        k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
-                        a.SetValue(RunName, new byte[] { 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, RegistryValueKind.Binary);
-                    }
-                    else
-                    {
-                        k.DeleteValue(RunName, false);
-                        a.DeleteValue(RunName, false);
-                    }
-                }
+                RemoveLegacyRunEntry();
+                if (!value) { Schtasks("/delete /tn \"" + TaskName + "\" /f"); return; }
+
+                string user = Environment.UserDomainName + "\\" + Environment.UserName;
+                string esc = System.Security.SecurityElement.Escape(user);
+                string xml =
+                    "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+                    "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
+                    "<RegistrationInfo><Description>Starts Claude Usage Bar at logon</Description></RegistrationInfo>" +
+                    "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + esc + "</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>" +
+                    "<Principals><Principal id=\"Author\"><UserId>" + esc + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>" +
+                    "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
+                    "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled></Settings>" +
+                    "<Actions Context=\"Author\"><Exec><Command>" + System.Security.SecurityElement.Escape(Application.ExecutablePath) + "</Command></Exec></Actions>" +
+                    "</Task>";
+                string tmp = Path.Combine(Path.GetTempPath(), "ClaudeUsageBar-task.xml");
+                File.WriteAllText(tmp, xml, Encoding.Unicode);
+                try { Schtasks("/create /tn \"" + TaskName + "\" /xml \"" + tmp + "\" /f"); }
+                finally { try { File.Delete(tmp); } catch { } }
             }
         }
 
