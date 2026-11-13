@@ -53,6 +53,7 @@ namespace ClaudeUsageBar
     class UsageException : Exception
     {
         public bool RateLimited;
+        public bool NeedsLogin; // token expired or rejected: Claude Code can renew it
         public UsageException(string msg) : base(msg) { }
         public UsageException(string msg, bool rateLimited) : base(msg) { RateLimited = rateLimited; }
     }
@@ -76,9 +77,10 @@ namespace ClaudeUsageBar
             return d;
         }
 
-        // Reads the OAuth access token Claude Code keeps on disk. Never refreshes it:
-        // Claude Code owns the refresh token, and rotating it from here could log Claude Code out.
-        static string ReadToken(JavaScriptSerializer js)
+        // Reads the OAuth access token Claude Code keeps on disk. Never refreshes it itself:
+        // Claude Code owns the refresh token (rotating it from here could log Claude Code out),
+        // so renewal is delegated to Claude Code — see ClaudeCli.Renew.
+        static string ReadToken(JavaScriptSerializer js, bool early)
         {
             string path = Path.Combine(ConfigDir(), ".credentials.json");
             if (!File.Exists(path)) throw new UsageException("Not signed in: run `claude` and log in with your Claude account.");
@@ -94,16 +96,29 @@ namespace ClaudeUsageBar
             if (oauth.TryGetValue("expiresAt", out o) && o != null)
             {
                 long ms = Convert.ToInt64(o);
-                if (DateTimeOffset.FromUnixTimeMilliseconds(ms) < DateTimeOffset.UtcNow)
-                    throw new UsageException("Login token expired: open Claude Code once and it will renew it.");
+                // Treat "about to expire" as expired so renewal happens before a request fails.
+                if (DateTimeOffset.FromUnixTimeMilliseconds(ms) < DateTimeOffset.UtcNow.AddMinutes(early ? 2 : 0))
+                    throw new UsageException("Login token expired.") { NeedsLogin = true };
             }
             return Convert.ToString(oauth["accessToken"]);
         }
 
         public static Usage Fetch()
         {
+            try { return FetchOnce(true); }
+            catch (UsageException ex)
+            {
+                if (!ex.NeedsLogin) throw;
+                if (!ClaudeCli.Renew())
+                    throw new UsageException("Login expired and auto-renew failed: open Claude Code once.");
+                return FetchOnce(false);
+            }
+        }
+
+        static Usage FetchOnce(bool early)
+        {
             var js = new JavaScriptSerializer();
-            string token = ReadToken(js);
+            string token = ReadToken(js, early);
 
             var req = (HttpWebRequest)WebRequest.Create(Endpoint);
             req.Method = "GET";
@@ -127,7 +142,7 @@ namespace ClaudeUsageBar
                 if (hr != null)
                 {
                     int code = (int)hr.StatusCode;
-                    if (code == 401) throw new UsageException("Login rejected (401): open Claude Code to renew it.");
+                    if (code == 401) throw new UsageException("Login rejected (401).") { NeedsLogin = true };
                     if (code == 429) throw new UsageException("Rate limited (429): backing off.", true);
                     throw new UsageException("Usage endpoint returned HTTP " + code + ".");
                 }
@@ -169,6 +184,75 @@ namespace ClaudeUsageBar
                 if (DateTimeOffset.TryParse((string)o, System.Globalization.CultureInfo.InvariantCulture,
                         System.Globalization.DateTimeStyles.AssumeUniversal, out dto))
                     reset = dto.LocalDateTime;
+            }
+        }
+    }
+
+    // Renews the login by asking Claude Code itself: `claude auth status` refreshes an expired
+    // token using Claude Code's own refresh logic and lock, costs no usage, and never clashes
+    // with a running Claude Code.
+    static class ClaudeCli
+    {
+        static DateTime lastAttempt = DateTime.MinValue;
+        static readonly object Gate = new object();
+
+        static string Find()
+        {
+            var candidates = new List<string>();
+            string path = Environment.GetEnvironmentVariable("PATH") ?? "";
+            foreach (string dir in path.Split(';'))
+            {
+                if (dir.Trim().Length == 0) continue;
+                candidates.Add(Path.Combine(dir.Trim(), "claude.exe"));
+                candidates.Add(Path.Combine(dir.Trim(), "claude.cmd"));
+            }
+            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            candidates.Add(Path.Combine(home, @".local\bin\claude.exe"));
+            candidates.Add(Path.Combine(roaming, @"npm\claude.cmd"));
+            foreach (string c in candidates)
+                try { if (File.Exists(c)) return c; } catch { }
+            return null;
+        }
+
+        public static bool Renew()
+        {
+            bool ok = RenewCore();
+            try
+            {
+                File.AppendAllText(Path.Combine(UsageClient.DataDir(), "renew.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + (ok ? "  renewed\r\n" : "  failed or throttled\r\n"));
+            }
+            catch { }
+            return ok;
+        }
+
+        static bool RenewCore()
+        {
+            lock (Gate)
+            {
+                // At most one attempt every 5 minutes, so a broken login doesn't spawn processes every poll.
+                if ((DateTime.Now - lastAttempt).TotalMinutes < 5) return false;
+                lastAttempt = DateTime.Now;
+                string exe = Find();
+                if (exe == null) return false;
+                bool isCmd = exe.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase);
+                var psi = new ProcessStartInfo(isCmd ? "cmd.exe" : exe,
+                                               isCmd ? "/c \"\"" + exe + "\" auth status\"" : "auth status")
+                {
+                    UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardOutput = true, RedirectStandardError = true
+                };
+                try
+                {
+                    using (var p = Process.Start(psi))
+                    {
+                        p.StandardOutput.ReadToEnd(); p.StandardError.ReadToEnd(); // output includes the account email; discard
+                        if (!p.WaitForExit(30000)) { try { p.Kill(); } catch { } return false; }
+                        return p.ExitCode == 0;
+                    }
+                }
+                catch { return false; }
             }
         }
     }
