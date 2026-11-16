@@ -25,7 +25,7 @@ build.cmd
 
 This compiles `ClaudeUsageBar.cs` with `csc.exe` from `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319`. You don't need the Visual Studio or .NET SDK.
 
-Run `ClaudeUsageBar.exe`. Right-click → **Start with Windows** to launch it at login.
+Run `ClaudeUsageBar.exe`. Right-click → **Start with Windows** to launch it at login. This creates a per-user Task Scheduler logon task, which needs no admin rights.
 
 ## Claude Code status light (optional)
 
@@ -44,12 +44,13 @@ Copy `hooks/usage-bar-status.mjs` to `~/.claude/hooks/` (needs Node.js) and add 
 }
 ```
 
-Replace `C:/Users/YOU` with your home folder. Each session writes its state to `%LOCALAPPDATA%\ClaudeUsageBar\sessions\`. With several sessions open, the widget shows the one that most needs you.
+Replace `C:/Users/YOU` with your home folder. Each session writes its state to `%USERPROFILE%\.claude-usage-bar\sessions\`. With several sessions open, the widget shows the one that most needs you.
 
 ## Notes
 
-- **The widget never refreshes your login token.** Claude Code owns the refresh token, and rotating it from a second app could log Claude Code out. If the token expires, the tooltip asks you to open Claude Code once.
-- The usage endpoint is undocumented and may change. The last response (usage numbers only, no credentials) is saved to `%LOCALAPPDATA%\ClaudeUsageBar\last-response.json` for troubleshooting.
+- **Login renewal is handled by Claude Code itself.** When the token expires, the widget runs `claude -p "/usage"` in the background. That's a local command: no model call, no usage, and it doesn't start a 5-hour window. Running it makes Claude Code refresh its own token, with its own lock, so the two apps never clash. If the endpoint still fails, the widget shows the numbers parsed from that output. It only asks you to act if Claude Code is actually logged out.
+- The usage endpoint is undocumented and may change. The last response (usage numbers only, no credentials) is saved to `%USERPROFILE%\.claude-usage-bar\last-response.json`, next to `widget.log`, for troubleshooting.
 - Memory use is ~50 MB, mostly the .NET runtime.
+- Data lives in `%USERPROFILE%\.claude-usage-bar`, not AppData. The Claude desktop app is a packaged (MSIX) app, and anything launched from it has its AppData and registry writes redirected into the package. That would split files between the widget and Claude Code's hooks.
 
 Not affiliated with Anthropic.

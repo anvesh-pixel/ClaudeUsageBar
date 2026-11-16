@@ -1,12 +1,14 @@
 // Reports Claude Code session state to the Claude Usage Bar taskbar widget.
 // Usage (from a hook): node usage-bar-status.mjs <working|input|done|end>
-// Writes %LOCALAPPDATA%\ClaudeUsageBar\sessions\<session_id>.json. Always exits 0, never blocks Claude.
+// Writes ~/.claude-usage-bar/sessions/<session_id>.json. Always exits 0, never blocks Claude.
+// Not under AppData on purpose: when Claude Code runs inside the Claude desktop app (an MSIX
+// package), AppData writes are redirected into the package and the widget would never see them.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 const state = process.argv[2];
-const dir = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), '.local', 'share'), 'ClaudeUsageBar', 'sessions');
+const dir = path.join(os.homedir(), '.claude-usage-bar', 'sessions');
 
 function write(raw) {
   try {
