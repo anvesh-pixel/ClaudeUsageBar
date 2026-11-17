@@ -53,6 +53,7 @@ namespace ClaudeUsageBar
     class UsageException : Exception
     {
         public bool RateLimited;
+        public bool NeedsLogin; // token expired or rejected: Claude Code can renew it
         public UsageException(string msg) : base(msg) { }
         public UsageException(string msg, bool rateLimited) : base(msg) { RateLimited = rateLimited; }
     }
@@ -69,16 +70,37 @@ namespace ClaudeUsageBar
             return dir;
         }
 
+        // Diagnostic log: fetch outcomes, renewals, startup. Never contains credentials.
+        // Falls back to %TEMP% (with the reason) if the data folder can't be written.
+        public static void Log(string line)
+        {
+            string text = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  [" + Process.GetCurrentProcess().Id + "] " + line + "\r\n";
+            try
+            {
+                string f = Path.Combine(DataDir(), "widget.log");
+                if (File.Exists(f) && new FileInfo(f).Length > 256 * 1024) File.Delete(f);
+                File.AppendAllText(f, text);
+            }
+            catch (Exception e)
+            {
+                try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "ClaudeUsageBar-widget.log"), text.TrimEnd() + "  (data log failed: " + e.Message + ")\r\n"); } catch { }
+            }
+        }
+
         public static string DataDir()
         {
-            string d = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ClaudeUsageBar");
+            // Not under AppData: processes launched from packaged (MSIX) apps such as the Claude
+            // desktop app get AppData redirected into the package, which would split the files
+            // between the widget, its hooks and anything started from Claude.
+            string d = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude-usage-bar");
             Directory.CreateDirectory(d);
             return d;
         }
 
-        // Reads the OAuth access token Claude Code keeps on disk. Never refreshes it:
-        // Claude Code owns the refresh token, and rotating it from here could log Claude Code out.
-        static string ReadToken(JavaScriptSerializer js)
+        // Reads the OAuth access token Claude Code keeps on disk. Never refreshes it itself:
+        // Claude Code owns the refresh token (rotating it from here could log Claude Code out),
+        // so renewal is delegated to Claude Code — see ClaudeCli.Renew.
+        static string ReadToken(JavaScriptSerializer js, bool early)
         {
             string path = Path.Combine(ConfigDir(), ".credentials.json");
             if (!File.Exists(path)) throw new UsageException("Not signed in: run `claude` and log in with your Claude account.");
@@ -94,16 +116,36 @@ namespace ClaudeUsageBar
             if (oauth.TryGetValue("expiresAt", out o) && o != null)
             {
                 long ms = Convert.ToInt64(o);
-                if (DateTimeOffset.FromUnixTimeMilliseconds(ms) < DateTimeOffset.UtcNow)
-                    throw new UsageException("Login token expired: open Claude Code once and it will renew it.");
+                // Treat "about to expire" as expired so renewal happens before a request fails.
+                if (DateTimeOffset.FromUnixTimeMilliseconds(ms) < DateTimeOffset.UtcNow.AddMinutes(early ? 2 : 0))
+                    throw new UsageException("Login token expired.") { NeedsLogin = true };
             }
             return Convert.ToString(oauth["accessToken"]);
         }
 
         public static Usage Fetch()
         {
+            try { return FetchOnce(true); }
+            catch (UsageException ex)
+            {
+                if (!ex.NeedsLogin) throw;
+                UsageClient.Log("token needs renewal (" + ex.Message + "): asking Claude Code");
+                string text = ClaudeCli.RunUsage();           // Claude Code refreshes its token here
+                try { return FetchOnce(false); }              // renewed: full data from the endpoint
+                catch (UsageException again)
+                {
+                    Usage parsed = ClaudeCli.Parse(text);     // fallback: numbers from Claude Code's /usage
+                    if (parsed != null) { UsageClient.Log("using /usage text fallback"); return parsed; }
+                    if (text == null) throw new UsageException("Couldn't run Claude Code to renew the login (" + again.Message + ").");
+                    throw new UsageException("Claude Code is logged out: run `claude` and log in.");
+                }
+            }
+        }
+
+        static Usage FetchOnce(bool early)
+        {
             var js = new JavaScriptSerializer();
-            string token = ReadToken(js);
+            string token = ReadToken(js, early);
 
             var req = (HttpWebRequest)WebRequest.Create(Endpoint);
             req.Method = "GET";
@@ -127,7 +169,7 @@ namespace ClaudeUsageBar
                 if (hr != null)
                 {
                     int code = (int)hr.StatusCode;
-                    if (code == 401) throw new UsageException("Login rejected (401): open Claude Code to renew it.");
+                    if (code == 401) throw new UsageException("Login rejected (401).") { NeedsLogin = true };
                     if (code == 429) throw new UsageException("Rate limited (429): backing off.", true);
                     throw new UsageException("Usage endpoint returned HTTP " + code + ".");
                 }
@@ -169,6 +211,118 @@ namespace ClaudeUsageBar
                 if (DateTimeOffset.TryParse((string)o, System.Globalization.CultureInfo.InvariantCulture,
                         System.Globalization.DateTimeStyles.AssumeUniversal, out dto))
                     reset = dto.LocalDateTime;
+            }
+        }
+    }
+
+    // Renews the login through Claude Code itself. `claude -p "/usage"` is a local command (no
+    // model call, no usage, doesn't start a 5-hour window) that fetches usage through Claude
+    // Code's authenticated path, so Claude Code refreshes an expired token with its own refresh
+    // logic and lock. Its text output doubles as a fallback data source.
+    // (`claude auth status` was tried first: it exits 0 but does NOT refresh the token.)
+    static class ClaudeCli
+    {
+        static readonly object Gate = new object();
+        static DateTime lastRun = DateTime.MinValue;
+        static string lastText;
+
+        static string Find()
+        {
+            var candidates = new List<string>();
+            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            candidates.Add(Path.Combine(home, @".local\bin\claude.exe"));
+            foreach (string raw in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
+            {
+                string dir = raw.Trim().Trim('"');
+                if (dir.Length == 0 || dir.IndexOfAny(Path.GetInvalidPathChars()) >= 0) continue;
+                candidates.Add(Path.Combine(dir, "claude.exe"));
+                candidates.Add(Path.Combine(dir, "claude.cmd"));
+            }
+            candidates.Add(Path.Combine(local, @"Microsoft\WinGet\Links\claude.exe"));
+            candidates.Add(Path.Combine(roaming, @"npm\claude.cmd"));
+            foreach (string c in candidates)
+                try { if (File.Exists(c)) return c; } catch { }
+            return null;
+        }
+
+        // Runs `claude -p "/usage"`; returns its stdout, or null. Reuses a result < 60 s old.
+        public static string RunUsage()
+        {
+            lock (Gate)
+            {
+                if (lastText != null && (DateTime.Now - lastRun).TotalSeconds < 60) return lastText;
+                lastRun = DateTime.Now;
+                lastText = null;
+                string exe = Find();
+                if (exe == null) { UsageClient.Log("renew: claude CLI not found"); return null; }
+                bool isCmd = exe.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase);
+                const string args = "-p \"/usage\"";
+                var psi = new ProcessStartInfo(isCmd ? "cmd.exe" : exe, isCmd ? "/c \"\"" + exe + "\" " + args + "\"" : args)
+                {
+                    UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardOutput = true, RedirectStandardError = true, RedirectStandardInput = true,
+                    StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8,
+                    WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                };
+                var sb = new StringBuilder();
+                try
+                {
+                    using (var p = Process.Start(psi))
+                    {
+                        p.StandardInput.Close();
+                        p.OutputDataReceived += (s, e) => { if (e.Data != null) lock (sb) sb.AppendLine(e.Data); };
+                        p.ErrorDataReceived += delegate { };
+                        p.BeginOutputReadLine(); p.BeginErrorReadLine();
+                        if (!p.WaitForExit(90000)) { try { p.Kill(); } catch { } UsageClient.Log("renew: claude -p /usage timed out"); return null; }
+                        p.WaitForExit(); // flush async output
+                        if (p.ExitCode != 0) { UsageClient.Log("renew: claude -p /usage exited " + p.ExitCode); return null; }
+                    }
+                }
+                catch (Exception e) { UsageClient.Log("renew: " + e.GetType().Name + ": " + e.Message); return null; }
+                lock (sb) lastText = sb.ToString();
+                UsageClient.Log("renew: ran claude -p /usage (" + lastText.Length + " chars)");
+                return lastText;
+            }
+        }
+
+        // Parses `/usage` text: "Current session: 23% used · resets Nov 16, 4:30pm (Asia/Kolkata)".
+        public static Usage Parse(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            var u = new Usage();
+            ParseLine(text, @"Current session:", out u.FiveHour, out u.FiveReset);
+            ParseLine(text, @"Current week \(all models\):", out u.Weekly, out u.WeekReset);
+            return u.FiveHour < 0 && u.Weekly < 0 ? null : u;
+        }
+
+        static void ParseLine(string text, string label, out double pct, out DateTime? reset)
+        {
+            pct = -1; reset = null;
+            var m = System.Text.RegularExpressions.Regex.Match(text,
+                label + @"\s*(\d+(?:\.\d+)?)%\s*used(?:[^\r\n]*?resets\s+((?:[A-Za-z]{3,9}\s+\d{1,2},\s*)?\d{1,2}(?::\d{2})?\s*[ap]\.?m\.?))?",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!m.Success) return;
+            pct = double.Parse(m.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+            if (!m.Groups[2].Success) return;
+            string s = System.Text.RegularExpressions.Regex.Replace(m.Groups[2].Value, @"\s*([ap])\.?m\.?$", "$1m",
+                           System.Text.RegularExpressions.RegexOptions.IgnoreCase).ToUpperInvariant();
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            string[] withDate = { "MMM d, h:mmtt", "MMM d, htt", "MMMM d, h:mmtt", "MMMM d, htt", "MMM d,h:mmtt", "MMM d,htt" };
+            string[] timeOnly = { "h:mmtt", "htt" };
+            DateTime dt;
+            if (DateTime.TryParseExact(s, withDate, ci, System.Globalization.DateTimeStyles.AllowWhiteSpaces, out dt))
+            {
+                dt = new DateTime(DateTime.Now.Year, dt.Month, dt.Day, dt.Hour, dt.Minute, 0);
+                if (dt < DateTime.Now.AddDays(-2)) dt = dt.AddYears(1); // across New Year
+                reset = dt;
+            }
+            else if (DateTime.TryParseExact(s, timeOnly, ci, System.Globalization.DateTimeStyles.AllowWhiteSpaces, out dt))
+            {
+                dt = DateTime.Today.Add(dt.TimeOfDay);
+                if (dt < DateTime.Now) dt = dt.AddDays(1);
+                reset = dt;
             }
         }
     }
@@ -288,39 +442,61 @@ namespace ClaudeUsageBar
             using (var k = Registry.CurrentUser.CreateSubKey(Key)) k.SetValue(name, value, RegistryValueKind.DWord);
         }
 
-        // Windows' Startup Apps on/off switch (Task Manager / Settings → Apps → Startup).
-        // First byte: even = enabled, odd = disabled. Some setups skip Run entries that have no
-        // approval value at all, so it's written explicitly when enabling.
+        // Startup uses a per-user Task Scheduler logon task, not the Run key: Explorer can silently
+        // skip Run entries (seen even with a valid StartupApproved value), while logon tasks
+        // always fire. The 10 s delay lets the taskbar come up first.
+        const string TaskName = "ClaudeUsageBar";
         const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
+        static int Schtasks(string args)
+        {
+            var psi = new ProcessStartInfo("schtasks.exe", args)
+            {
+                UseShellExecute = false, CreateNoWindow = true,
+                RedirectStandardOutput = true, RedirectStandardError = true
+            };
+            using (var p = Process.Start(psi))
+            {
+                p.StandardOutput.ReadToEnd(); p.StandardError.ReadToEnd();
+                if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } return -1; }
+                return p.ExitCode;
+            }
+        }
+
+        static void RemoveLegacyRunEntry()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true)) if (k != null) k.DeleteValue(RunName, false);
+                using (var a = Registry.CurrentUser.OpenSubKey(ApprovedKey, true)) if (a != null) a.DeleteValue(RunName, false);
+            }
+            catch { }
+        }
 
         public static bool StartWithWindows
         {
-            get
-            {
-                using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
-                    if (k == null || k.GetValue(RunName) == null) return false;
-                using (var a = Registry.CurrentUser.OpenSubKey(ApprovedKey))
-                {
-                    var b = a == null ? null : a.GetValue(RunName) as byte[];
-                    return b == null || b.Length == 0 || (b[0] & 1) == 0;
-                }
-            }
+            get { return Schtasks("/query /tn \"" + TaskName + "\"") == 0; }
             set
             {
-                using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
-                using (var a = Registry.CurrentUser.CreateSubKey(ApprovedKey))
-                {
-                    if (value)
-                    {
-                        k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
-                        a.SetValue(RunName, new byte[] { 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, RegistryValueKind.Binary);
-                    }
-                    else
-                    {
-                        k.DeleteValue(RunName, false);
-                        a.DeleteValue(RunName, false);
-                    }
-                }
+                RemoveLegacyRunEntry();
+                if (!value) { Schtasks("/delete /tn \"" + TaskName + "\" /f"); return; }
+
+                string user = Environment.UserDomainName + "\\" + Environment.UserName;
+                string esc = System.Security.SecurityElement.Escape(user);
+                string xml =
+                    "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+                    "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
+                    "<RegistrationInfo><Description>Starts Claude Usage Bar at logon</Description></RegistrationInfo>" +
+                    "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + esc + "</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>" +
+                    "<Principals><Principal id=\"Author\"><UserId>" + esc + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>" +
+                    "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
+                    "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled></Settings>" +
+                    "<Actions Context=\"Author\"><Exec><Command>" + System.Security.SecurityElement.Escape(Application.ExecutablePath) + "</Command></Exec></Actions>" +
+                    "</Task>";
+                string tmp = Path.Combine(Path.GetTempPath(), "ClaudeUsageBar-task.xml");
+                File.WriteAllText(tmp, xml, Encoding.Unicode);
+                try { Schtasks("/create /tn \"" + TaskName + "\" /xml \"" + tmp + "\" /f"); }
+                finally { try { File.Delete(tmp); } catch { } }
             }
         }
 
@@ -567,6 +743,7 @@ namespace ClaudeUsageBar
             base.OnHandleCreated(e);
             foregroundProc = OnForegroundChanged;
             foregroundHook = Native.SetWinEventHook(3, 3, IntPtr.Zero, foregroundProc, 0, 0, 0); // EVENT_SYSTEM_FOREGROUND
+            UsageClient.Log("started: " + Application.ExecutablePath + ", priority " + Process.GetCurrentProcess().PriorityClass);
             Render(true);
             layoutTimer.Start();
             FetchAsync();
@@ -724,8 +901,10 @@ namespace ClaudeUsageBar
                 Usage u = null; string err = null; bool rate = false;
                 try { u = UsageClient.Fetch(); }
                 catch (UsageException ex) { err = ex.Message; rate = ex.RateLimited; }
-                catch (Exception ex) { err = ex.Message; }
-                try { BeginInvoke((Action)(() => OnFetched(u, err, rate))); } catch { }
+                catch (Exception ex) { err = ex.Message; UsageClient.Log("fetch crashed: " + ex.GetType().Name + ": " + ex.Message); }
+                UsageClient.Log(u != null ? "fetch ok: 5h " + u.FiveHour + "%, W " + u.Weekly + "%" : "fetch failed: " + err);
+                try { BeginInvoke((Action)(() => OnFetched(u, err, rate))); }
+                catch (Exception ex) { UsageClient.Log("could not deliver result to UI: " + ex.Message); fetching = false; }
             });
         }
 
